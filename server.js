@@ -2,214 +2,253 @@ const express = require('express');
 const cors    = require('cors');
 const https   = require('https');
 const http    = require('http');
+const crypto  = require('crypto');
 const app     = express();
 const PORT    = process.env.PORT || 3000;
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ── HTTP helper ───────────────────────────────────────────────────────────────
-function httpGet(url, headers = {}, timeoutMs = 15000) {
+// ── HTTP GET helper ───────────────────────────────────────────────────────────
+function get(url, extraHeaders = {}, ms = 15000) {
   return new Promise((resolve, reject) => {
-    const mod    = url.startsWith('https') ? https : http;
-    const timer  = setTimeout(() => reject(new Error('Timeout')), timeoutMs);
-    const opts   = require('url').parse(url);
-    opts.headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0',
-      'Accept': '*/*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Referer': 'https://anitaku.pe/',
-      ...headers
+    const parsed = new URL(url);
+    const mod    = parsed.protocol === 'https:' ? https : http;
+    const timer  = setTimeout(() => reject(new Error('Timeout ' + ms + 'ms')), ms);
+
+    const options = {
+      hostname: parsed.hostname,
+      port:     parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path:     parsed.pathname + parsed.search,
+      method:   'GET',
+      headers: {
+        'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'identity',
+        'Connection':      'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        ...extraHeaders
+      }
     };
 
-    const req = mod.get(opts, (res) => {
-      // Follow redirects up to 3 times
-      if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) && res.headers.location) {
+    const req = mod.request(options, (res) => {
+      if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location) {
         clearTimeout(timer);
-        const next = res.headers.location.startsWith('http') ? res.headers.location : `https://anitaku.pe${res.headers.location}`;
-        return httpGet(next, headers, timeoutMs).then(resolve).catch(reject);
+        const next = res.headers.location.startsWith('http')
+          ? res.headers.location
+          : `${parsed.protocol}//${parsed.hostname}${res.headers.location}`;
+        return get(next, extraHeaders, ms).then(resolve).catch(reject);
       }
-
       let body = '';
       res.setEncoding('utf8');
       res.on('data', c => body += c);
-      res.on('end', () => {
-        clearTimeout(timer);
-        resolve({ status: res.statusCode, ok: res.statusCode >= 200 && res.statusCode < 400, body, headers: res.headers });
-      });
+      res.on('end',  () => { clearTimeout(timer); resolve({ status: res.statusCode, ok: res.statusCode < 400, body, headers: res.headers }); });
     });
 
     req.on('error', e => { clearTimeout(timer); reject(e); });
+    req.end();
   });
 }
 
-// ── Health ─────────────────────────────────────────────────────────────────────
-app.get('/', (_, res) => res.json({ status: 'ok', service: 'MultiPlay v4' }));
-
-// ── /anime/watch/:episodeId ────────────────────────────────────────────────────
-// Returns direct m3u8 sources — played in <video> tag with ZERO ads
-app.get('/anime/watch/:episodeId', async (req, res) => {
-  const episodeId = decodeURIComponent(req.params.episodeId);
-  console.log('[watch]', episodeId);
-
-  const sources   = [];
-  const errors    = [];
-
-  // ── Step 1: Get episode page from anitaku.pe ─────────────────────────────
-  let embedUrl = null;
+// ── Decrypt gogoanime stream (they use AES encryption on the URLs) ────────────
+function decryptUrl(input, key, iv) {
   try {
-    const pageUrl  = `https://anitaku.pe/${episodeId}`;
-    const page     = await httpGet(pageUrl);
-
-    if (!page.ok) throw new Error(`Page status ${page.status}`);
-
-    // Extract embed server URLs from page
-    // Pattern 1: <div class="play-video"><iframe src="...">
-    const iframe1  = page.body.match(/class="play-video"[^>]*>[\s\S]*?<iframe[^>]*src="([^"]+)"/);
-    // Pattern 2: <li class="servers-sub"><a data-video="...">
-    const iframe2  = page.body.match(/data-video="([^"]+gogocdn[^"]+)"/);
-    const iframe3  = page.body.match(/data-video="([^"]+vidstreaming[^"]+)"/);
-    // Pattern 3: link href in page
-    const iframe4  = page.body.match(/https:\/\/emb\.gogocdn\.net\/embed\/[^\s"']+/);
-
-    embedUrl = (iframe1 && iframe1[1]) ||
-               (iframe2 && iframe2[1]) ||
-               (iframe3 && iframe3[1]) ||
-               (iframe4 && iframe4[0]);
-
-    if (embedUrl && embedUrl.startsWith('//')) embedUrl = 'https:' + embedUrl;
-    console.log('[watch] embed URL:', embedUrl);
+    const decipher = crypto.createDecipheriv('aes-256-cbc',
+      Buffer.from(key, 'utf8'),
+      Buffer.from(iv,  'utf8')
+    );
+    let dec = decipher.update(input, 'base64', 'utf8');
+    dec += decipher.final('utf8');
+    return dec;
   } catch(e) {
-    errors.push('Step1 (page): ' + e.message);
-    console.log('[watch] Step1 error:', e.message);
+    return null;
   }
+}
 
-  // ── Step 2: Fetch embed page and extract streaming sources ────────────────
-  if (embedUrl) {
-    try {
-      const embedPage = await httpGet(embedUrl, { 'Referer': 'https://anitaku.pe/' });
+// Keys used by gogoanime embed player (public, reverse engineered)
+const GOGO_KEYS = {
+  key:       'UIVoTRDosArmFeshkdLrvcoj',   // 24 bytes -> use 32 by padding
+  secondKey: 'RRFHEFE@#@:FFFD3333LLDDDERRR',
+  iv:        '@@#@^@^#^@@@^@^@'
+};
 
-      if (embedPage.ok) {
-        // Extract m3u8 URLs - multiple patterns
-        const m3u8Pattern  = /https?:\/\/[^\s"'<>]+\.m3u8(?:\?[^\s"'<>]*)?/g;
-        const m3u8Matches  = [...embedPage.body.matchAll(m3u8Pattern)];
+// ── Health ────────────────────────────────────────────────────────────────────
+app.get('/', (_, res) => res.json({ status: 'ok', service: 'MultiPlay Anime v4' }));
 
-        for (const m of m3u8Matches) {
-          const url = m[0].replace(/\\u002F/g, '/').replace(/&amp;/g, '&');
-          if (!sources.find(s => s.url === url)) {
-            const quality = url.includes('1080') ? '1080p' : url.includes('720') ? '720p' : url.includes('480') ? '480p' : 'auto';
-            sources.push({ url, isM3U8: true, quality });
-          }
-        }
+// ── /anime/watch/:episodeId ───────────────────────────────────────────────────
+app.get('/anime/watch/:episodeId', async (req, res) => {
+  const epId = decodeURIComponent(req.params.episodeId);
+  console.log('[watch]', epId);
+  const errors  = [];
+  let   sources = [];
 
-        // Also look for jwplayer/videojs sources
-        const fileMatch = embedPage.body.match(/(?:file|src):\s*['"](https?:\/\/[^'"]+\.m3u8[^'"]*)['"]/);
-        if (fileMatch && !sources.find(s => s.url === fileMatch[1])) {
-          sources.push({ url: fileMatch[1], isM3U8: true, quality: 'auto' });
-        }
+  // ─────────────────────────────────────────────────────────────────────────
+  // STRATEGY 1: emb.gogocdn.net embed (no Cloudflare, no auth needed)
+  // ─────────────────────────────────────────────────────────────────────────
+  try {
+    const embedUrl = `https://emb.gogocdn.net/embed/${epId}`;
+    console.log('[S1] Fetching embed:', embedUrl);
+    const embed = await get(embedUrl, { 'Referer': 'https://anitaku.pe/' });
 
-        // Look for encoded/escaped URLs
-        const encodedMatch = embedPage.body.match(/\\u0068\\u0074\\u0074\\u0070[\\u0-9a-f]*/);
-        if (encodedMatch) {
-          try {
-            const decoded = JSON.parse('"' + encodedMatch[0] + '"');
-            if (decoded.includes('.m3u8')) sources.push({ url: decoded, isM3U8: true, quality: 'auto' });
-          } catch(e) {}
-        }
+    if (embed.ok && embed.body.length > 100) {
+      console.log('[S1] Embed page size:', embed.body.length);
 
-        console.log('[watch] Found sources from embed:', sources.length);
-      }
-    } catch(e) {
-      errors.push('Step2 (embed): ' + e.message);
-      console.log('[watch] Step2 error:', e.message);
-    }
-  }
+      // Extract the streaming.php link (contains encrypted params)
+      const streamMatch = embed.body.match(/https?:\/\/[^"'\s]*streaming\.php[^"'\s]*/);
+      const streamUrl   = streamMatch ? streamMatch[0].replace(/&amp;/g, '&') : null;
+      console.log('[S1] Stream URL:', streamUrl ? 'found' : 'not found');
 
-  // ── Step 3: Try Ajax API as fallback ──────────────────────────────────────
-  if (!sources.length) {
-    try {
-      // Get anime category page to find movie_id
-      const epParts  = episodeId.match(/^(.+)-episode-(\d+)$/);
-      if (epParts) {
-        const slug   = epParts[1];
-        const epNum  = epParts[2];
-        const catUrl = `https://anitaku.pe/category/${slug}`;
-        const cat    = await httpGet(catUrl);
+      if (streamUrl) {
+        const streamPage = await get(streamUrl, {
+          'Referer': embedUrl,
+          'X-Requested-With': 'XMLHttpRequest'
+        });
 
-        const movieId = (cat.body.match(/value="(\d+)"\s+name="movie_id"/) || [])[1];
-        const alias   = (cat.body.match(/value="([^"]+)"\s+name="alias_anime"/) || [])[1];
-
-        if (movieId && alias) {
-          const ajaxUrl = `https://ajax.gogocdn.net/ajax/load-list-episode?ep_start=${epNum}&ep_end=${epNum}&id=${movieId}&default_ep=0&alias=${alias}`;
-          const ajax    = await httpGet(ajaxUrl, { 'X-Requested-With': 'XMLHttpRequest' });
-
-          const href    = (ajax.body.match(/href="\/([^"]+)"/) || [])[1];
-          if (href) {
-            const epPage  = await httpGet(`https://anitaku.pe/${href}`);
-            const m3u8    = epPage.body.match(/https?:\/\/[^\s"'<>]+\.m3u8(?:\?[^\s"'<>]*)?/);
-            if (m3u8) {
-              sources.push({ url: m3u8[0], isM3U8: true, quality: 'auto' });
-              console.log('[watch] Ajax fallback found source');
+        if (streamPage.ok) {
+          // Extract all m3u8 URLs
+          const m3u8s = [...streamPage.body.matchAll(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/g)];
+          for (const m of m3u8s) {
+            const u = m[0].replace(/&amp;/g, '&');
+            if (!sources.find(s => s.url === u)) {
+              const q = u.includes('1080') ? '1080p' : u.includes('720') ? '720p' : u.includes('480') ? '480p' : 'auto';
+              sources.push({ url: u, isM3U8: true, quality: q });
             }
           }
+
+          // Also try jwplayer sources
+          const jwMatch = streamPage.body.match(/jwplayer\([^)]+\)\.setup\((\{[\s\S]+?\})\)/);
+          if (jwMatch) {
+            try {
+              const cfg = JSON.parse(jwMatch[1].replace(/'/g, '"'));
+              if (cfg.sources) {
+                for (const s of cfg.sources) {
+                  if (s.file && !sources.find(x => x.url === s.file)) {
+                    sources.push({ url: s.file, isM3U8: s.file.includes('.m3u8'), quality: s.label || 'auto' });
+                  }
+                }
+              }
+            } catch(e) {}
+          }
+
+          console.log('[S1] Sources from streamPage:', sources.length);
         }
       }
-    } catch(e) {
-      errors.push('Step3 (ajax): ' + e.message);
+
+      // Fallback: look for m3u8 directly in embed page
+      if (!sources.length) {
+        const directM3u8 = [...embed.body.matchAll(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/g)];
+        for (const m of directM3u8) {
+          const u = m[0];
+          if (!sources.find(s => s.url === u)) sources.push({ url: u, isM3U8: true, quality: 'auto' });
+        }
+        console.log('[S1] Direct m3u8 from embed:', sources.length);
+      }
     }
+  } catch(e) { errors.push('S1: ' + e.message); console.log('[S1] Error:', e.message); }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // STRATEGY 2: Use gogocdn AJAX to get video server, then get stream
+  // ─────────────────────────────────────────────────────────────────────────
+  if (!sources.length) {
+    try {
+      // The gogocdn embed also has a secondary server fetch endpoint
+      const ajaxEmbed = `https://ajax.gogocdn.net/embed/${epId}`;
+      const ae = await get(ajaxEmbed, { 'Referer': 'https://anitaku.pe/' });
+      if (ae.ok) {
+        const m3u8s = [...ae.body.matchAll(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/g)];
+        for (const m of m3u8s) {
+          sources.push({ url: m[0], isM3U8: true, quality: 'auto' });
+        }
+        console.log('[S2] Ajax embed sources:', sources.length);
+      }
+    } catch(e) { errors.push('S2: ' + e.message); }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // STRATEGY 3: Try the anime.js API (a working public endpoint)
+  // ─────────────────────────────────────────────────────────────────────────
+  if (!sources.length) {
+    try {
+      // Some public Consumet mirrors on Vercel (different from the dead ones)
+      const mirrors = [
+        'https://consumet-api-one-eta.vercel.app',
+        'https://consumet-pi.vercel.app',
+        'https://consumet-3qp9.vercel.app',
+      ];
+      for (const mirror of mirrors) {
+        try {
+          const r = await get(`${mirror}/anime/gogoanime/watch/${encodeURIComponent(epId)}`, {}, 10000);
+          if (r.ok) {
+            const j = JSON.parse(r.body);
+            if (j.sources && j.sources.length) {
+              sources = j.sources;
+              console.log('[S3] Mirror sources:', mirror, sources.length);
+              break;
+            }
+          }
+        } catch(e) { continue; }
+      }
+    } catch(e) { errors.push('S3: ' + e.message); }
   }
 
   if (sources.length) {
-    // Sort: 1080p first
     const qOrder = ['1080p','720p','480p','360p','auto'];
-    sources.sort((a, b) => {
+    sources.sort((a,b) => {
       const ai = qOrder.indexOf(a.quality); const bi = qOrder.indexOf(b.quality);
-      return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi);
+      return (ai<0?99:ai)-(bi<0?99:bi);
     });
-    return res.json({ sources, errors });
+    console.log('[done] Returning', sources.length, 'sources');
+    return res.json({ sources });
   }
 
-  return res.status(404).json({ sources: [], errors, message: 'No sources found' });
+  console.log('[done] No sources. Errors:', errors);
+  return res.status(404).json({ sources: [], errors });
 });
 
-// ── /proxy?url=... — proxy M3U8 segments to fix CORS ─────────────────────────
+// ── /proxy?url= — proxies m3u8 + rewrites segment URLs ───────────────────────
 app.get('/proxy', async (req, res) => {
-  const rawUrl = req.query.url;
-  if (!rawUrl) return res.status(400).send('Missing url');
+  const raw = req.query.url;
+  if (!raw) return res.status(400).send('Missing url');
 
   try {
-    const url = decodeURIComponent(rawUrl);
-    const mod = url.startsWith('https') ? https : http;
-    const parsed = require('url').parse(url);
-    parsed.headers = {
-      'Referer': 'https://anitaku.pe/',
-      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
-      'Origin': 'https://anitaku.pe',
-      'Accept': '*/*'
+    const url     = decodeURIComponent(raw);
+    const isM3U8  = url.includes('.m3u8');
+    const parsed  = new URL(url);
+    const mod     = parsed.protocol === 'https:' ? https : http;
+
+    const options = {
+      hostname: parsed.hostname,
+      port:     parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path:     parsed.pathname + parsed.search,
+      method:   'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
+        'Referer':    'https://anitaku.pe/',
+        'Origin':     'https://anitaku.pe',
+        'Accept':     '*/*'
+      }
     };
 
-    const upstream = mod.get(parsed, (upRes) => {
-      const ct = upRes.headers['content-type'] || 'application/vnd.apple.mpegurl';
+    const upReq = mod.request(options, (upRes) => {
+      const ct = upRes.headers['content-type'] || (isM3U8 ? 'application/vnd.apple.mpegurl' : 'video/MP2T');
       res.set('Content-Type', ct);
       res.set('Access-Control-Allow-Origin', '*');
-      res.set('Access-Control-Allow-Headers', '*');
+      res.set('Cache-Control', 'no-cache');
 
-      // For m3u8 playlists, rewrite internal URLs to also go through proxy
-      if (ct.includes('mpegurl') || rawUrl.includes('.m3u8')) {
+      if (isM3U8) {
+        // Rewrite segment and sub-playlist URLs through our proxy
+        const base = url.substring(0, url.lastIndexOf('/') + 1);
+        const host = `${req.protocol}://${req.get('host')}`;
         let body = '';
         upRes.setEncoding('utf8');
         upRes.on('data', c => body += c);
         upRes.on('end', () => {
-          // Rewrite relative URLs in m3u8 to absolute proxied URLs
-          const baseUrl = url.substring(0, url.lastIndexOf('/') + 1);
-          const rewritten = body.replace(/^([^#\n][^\n]+\.ts[^\n]*)/gm, (line) => {
-            if (line.startsWith('http')) {
-              return `${req.protocol}://${req.get('host')}/proxy?url=${encodeURIComponent(line)}`;
-            } else {
-              return `${req.protocol}://${req.get('host')}/proxy?url=${encodeURIComponent(baseUrl + line)}`;
-            }
-          }).replace(/^(https?:\/\/[^\n]+\.m3u8[^\n]*)/gm, (line) => {
-            return `${req.protocol}://${req.get('host')}/proxy?url=${encodeURIComponent(line)}`;
+          const rewritten = body.replace(/^([^#].+)$/gm, (line) => {
+            const trimmed = line.trim();
+            if (!trimmed) return line;
+            const absUrl = trimmed.startsWith('http') ? trimmed : base + trimmed;
+            return `${host}/proxy?url=${encodeURIComponent(absUrl)}`;
           });
           res.send(rewritten);
         });
@@ -218,12 +257,9 @@ app.get('/proxy', async (req, res) => {
       }
     });
 
-    upstream.on('error', e => {
-      if (!res.headersSent) res.status(502).send('Proxy error: ' + e.message);
-    });
-  } catch(e) {
-    res.status(500).send('Error: ' + e.message);
-  }
+    upReq.on('error', e => { if (!res.headersSent) res.status(502).send(e.message); });
+    upReq.end();
+  } catch(e) { res.status(500).send(e.message); }
 });
 
-app.listen(PORT, () => console.log(`MultiPlay v4 running on port ${PORT}`));
+app.listen(PORT, () => console.log('MultiPlay Anime v4 on port', PORT));
